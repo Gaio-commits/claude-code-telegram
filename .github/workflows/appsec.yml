@@ -1,0 +1,341 @@
+name: Security Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      security_checks_enabled:
+        description: 'Rodar checks?'
+        required: true
+        default: true
+        type: boolean
+
+  # Roda automático toda vez que subir código
+  push:
+    branches:
+      - main 
+
+  pull_request:
+    branches:
+      - main
+
+  schedule:
+    - cron: '0 0 * * 1' 
+    
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+  
+jobs:
+
+  # =====================================================================================
+  # ETAPA 1: ANÁLISE ESTÁTICA DE SEGURANÇA DE APLICAÇÃO (SAST)
+  # Objetivo: Analisar o código-fonte em busca de padrões de
+  # vulnerabilidades conhecidas, sem executar a aplicação.
+  # Ferramentas: Semgrep
+  # =====================================================================================
+  sast-analysis:
+    name: Análise Estática de Segurança (SAST com Semgrep)
+    runs-on: ubuntu-latest
+    container:
+      image: returntocorp/semgrep
+    steps:
+    
+      - name: Checkout do código do repositório (fork do leitor)
+        uses: actions/checkout@v4
+        
+      - name: Executar Semgrep (Perfil AI/Python)
+        run: |
+          semgrep scan \
+            --config "p/default" \
+            --config "p/python" \
+            --config "p/owasp-top-ten" \
+            --config "p/bandit" \
+            --config "r/python.lang.security.deserialization" \
+            --sarif --output semgrep.sarif \
+            || true
+
+      - name: Corrigir SARIF do Semgrep (Versão Ultra-Resiliente)
+        run: |
+          python3 -c "
+          import json
+          import os
+
+          file_path = 'semgrep.sarif'
+          if not os.path.exists(file_path):
+              print('Arquivo não encontrado. Pulando correção.')
+              exit(0)
+
+          with open(file_path, 'r') as f:
+              try:
+                  data = json.load(f)
+              except Exception as e:
+                  print(f'Erro ao ler JSON: {e}')
+                  exit(0)
+
+          # Mapeamento seguro: Texto -> Número (Padrão GitHub)
+          mapping = {
+              'critical': '9.0',
+              'high': '8.0',
+              'medium': '5.0',
+              'low': '2.0',
+              'info': '1.0'
+          }
+
+          # Navegação segura por níveis (sem dar IndexError)
+          for run in data.get('runs', []):
+              # Tenta chegar até a lista de regras
+              tool = run.get('tool', {})
+              driver = tool.get('driver', {})
+              rules = driver.get('rules', [])
+              
+              for rule in rules:
+                  props = rule.get('properties', {})
+                  sev = props.get('security-severity', None)
+                  
+                  # Se existir a propriedade e ela for uma string (texto)
+                  if sev and isinstance(sev, str):
+                      # Se for número em formato de string (ex: '8.5'), ignora
+                      if sev.replace('.', '').isdigit():
+                          continue
+                      
+                      # Pega a primeira palavra (ex: 'High - [AI]' -> 'high')
+                      clean_key = sev.split()[0].lower()
+                      # Troca pelo número do mapa, ou 1.0 se não conhecer a palavra
+                      props['security-severity'] = mapping.get(clean_key, '1.0')
+                      print(f'Corrigido: {sev} -> {props['security-severity']}')
+
+          with open(file_path, 'w') as f:
+              json.dump(data, f, indent=2)
+          "
+          
+      - name: Upload do relatório SARIF do Semgrep (Artefato para download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: semgrep-results
+          path: semgrep.sarif
+          if-no-files-found: warn 
+
+      - name: Upload do resultado SARIF do Semgrep para GitHub Security
+        if: always() && hashFiles('semgrep.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-python-ai-litigation 
+
+  # =====================================================================================
+  # ETAPA 2: ANÁLISE DE COMPOSIÇÃO DE SOFTWARE (SCA) E GERAÇÃO DE SBOM
+  # Objetivo: Identificar componentes de terceiros (dependências)
+  # e suas vulnerabilidades conhecidas. Também geraremos um Software Bill of Materials (SBOM).
+  # Ferramentas: Syft e OWASP Dependency-Check
+  # =====================================================================================
+  sca-analysis:
+    name: Análise de Composição de Software (SCA) e Geração de SBOM
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout do código do repositório (fork)
+        uses: actions/checkout@v4
+
+      - name: Configurar Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Instalar Libs do Sistema (Fix Pillow)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libjpeg-dev zlib1g-dev
+
+      - name: Preparar Dependências (Conversão de uv.lock)
+        run: |
+          python -m pip install --upgrade pip
+          pip install uv
+          
+          if [ -f "uv.lock" ]; then
+            echo "uv.lock encontrado! Exportando para requirements.txt para análise..."
+            uv export --no-hashes > requirements.txt
+          elif [ -f "pyproject.toml" ]; then
+            echo "uv.lock não encontrado, tentando compilar via pyproject.toml..."
+            uv pip compile pyproject.toml -o requirements.txt
+          else
+            echo "Nenhum arquivo de gerenciamento de dependências encontrado."
+          fi
+          
+          if [ -f requirements.txt ]; then 
+            pip install -r requirements.txt
+          fi
+          
+      - name: Gerar SBOM com Syft
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: bom.json
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v4 
+        with:
+          name: sbom-cyclonedx 
+          path: bom.json       
+          if-no-files-found: error
+
+      # --- SCA com OWASP Dependency-Check ---
+      - name: Configurar Java para Dependency-Check
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Get current date
+        id: date
+        run: echo "today=$(date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+        
+      - name: Cache do banco de dados NVD do Dependency-Check
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/nvd-data 
+          key: ${{ runner.os }}-nvd-db-${{ steps.date.outputs.today }}
+          restore-keys: |
+            ${{ runner.os }}-nvd-db-
+
+      - name: Instalar OWASP Dependency-Check
+        run: |
+          DC_VERSION="12.1.0"
+          wget https://github.com/jeremylong/DependencyCheck/releases/download/v${DC_VERSION}/dependency-check-${DC_VERSION}-release.zip -O $RUNNER_TEMP/dc.zip
+          unzip $RUNNER_TEMP/dc.zip -d $RUNNER_TEMP/dependency-check
+          
+      - name: Executar OWASP Dependency-Check
+        continue-on-error: true
+        env:
+          JAVA_OPTS: "-Xmx6g"
+        run: |
+          mkdir -p reports
+          $RUNNER_TEMP/dependency-check/dependency-check/bin/dependency-check.sh \
+            --scan . \
+            --data "${{ runner.temp }}/nvd-data" \
+            --project "Lopti-App-Sec" \
+            --format SARIF \
+            --out dependency-check-results.sarif \
+            --enableExperimental \
+            --nvdApiKey ${{ secrets.NVD_API_KEY }} \
+            --ossIndexUsername ${{ secrets.OSS_INDEX_USER }} \
+            --ossIndexPassword ${{ secrets.OSS_INDEX_KEY }} \
+            --disableAssembly \
+            --exclude "**/__pycache__/**" \
+            --exclude "**/.venv/**" \
+            --exclude "**/venv/**" \
+            --exclude "**/build/**" \
+            --exclude "$RUNNER_TEMP/**" \
+            --exclude "**/test/**" \
+            --failOnCVSS 11
+          
+          echo "Listando arquivos após Dependency-Check:"
+          ls -la .
+          
+          if [ ! -f dependency-check-results.sarif ]; then
+            echo "::error::Arquivo dependency-check-results.sarif NÃO foi gerado."
+            if [ -f dependency-check.log ]; then
+              echo "Conteúdo do log de depuração do Dependency-Check (últimas 50 linhas):"
+              tail -n 50 dependency-check.log # Mostra o final do log para depuração
+            else
+              echo "Log de depuração do Dependency-Check (dependency-check.log) não encontrado."
+            fi
+          else
+            echo "Dependency-Check concluído. Relatório SARIF: dependency-check-results.sarif"
+          fi
+
+      - name: Sanitizar relatório SARIF (Opcional)
+        run: |
+          if [ -f dependency-check-results.sarif ]; then
+            echo "Limpando URIs inválidas no SARIF..."
+            sed -i 's|requirements.txt?[^"]*|requirements.txt|g' dependency-check-results.sarif
+          fi
+
+      - name: Upload do relatório SARIF do Dependency-Check (Artefato para download)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Dependency-Check-Scan-Results
+          path: dependency-check-results.sarif
+          if-no-files-found: warn 
+
+      - name: Upload do resultado SARIF do Dependency-Check para GitHub Security
+        if: always() && hashFiles('dependency-check-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: dependency-check-results.sarif
+          category: owasp-dependency-check-ai-litigation
+
+  # =====================================================================================
+  # ETAPA 3: SCAN DE SEGREDOS
+  # Objetivo: Verificar se há segredos (senhas, chaves de API, tokens) commitados
+  # acidentalmente no código-fonte do fork, INCLUINDO O HISTÓRICO COMPLETO.
+  # Ferramenta: Gitleaks
+  # =====================================================================================
+  secrets-scan:
+    name: Varredura de Segredos com Gitleaks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Instalar Gitleaks (Binary)
+        run: |
+          GITLEAKS_VERSION="8.18.4"
+          wget https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
+          tar -xzf gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
+          sudo mv gitleaks /usr/local/bin/
+
+      - name: Executar Gitleaks (Full Scan)
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        run: |
+          gitleaks detect --source . --report-format sarif --report-path results.sarif --redact --verbose || true
+
+      - name: Upload do resultado SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: results.sarif
+          category: gitleaks-ai-litigation
+          
+  # ===========================================================================
+  # ETAPA 4: SCAN DO SISTEMA DE ARQUIVOS
+  # Objetivo: Escanear o código fonte atual (.) em busca de vulns e misconfigs
+  # sem precisar criar uma imagem Docker.
+  # Ferramentas: Trivy
+  # ===========================================================================
+  trivy-scan-fs:
+    name: Scan de Código/Config (Trivy FS)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Executar Trivy (Filesystem)
+        uses: aquasecurity/trivy-action@0.29.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          scanners: 'vuln,misconfig,license'
+          format: 'sarif'                
+          output: 'trivy-fs-results.sarif' 
+          severity: 'CRITICAL,HIGH'
+          skip-files: "**/*.pt,**/*.pth,**/*.h5,**/*.gguf,**/*.safetensors,**/*.pkl,**/*.bin,**/*.onnx"
+          ignore-unfixed: true
+          exit-code: '0'       
+
+      - name: Upload Relatório Trivy (Artefato)
+        uses: actions/upload-artifact@v4
+        with:
+          name: Relatorio-Config-Trivy
+          path: trivy-fs-results.sarif
+
+      - name: Enviar para GitHub Security
+        if: always() && hashFiles('trivy-fs-results.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4 
+        with:
+          sarif_file: 'trivy-fs-results.sarif'
+          category: trivy-fs-ai-litigation
