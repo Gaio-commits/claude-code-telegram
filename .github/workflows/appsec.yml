@@ -148,31 +148,41 @@ jobs:
           sudo apt-get install -y libjpeg-dev zlib1g-dev
 
       - name: Preparar Dependências (Conversão de uv.lock)
-        continue-on-error: true # Silenciador: Se der erro, o workflow continua verde
         run: |
+          echo "Lendo uv.lock diretamente na marra para contornar erros de versão do uv..."
           python -m pip install --upgrade pip
-          pip install uv
+          pip install tomli
           
-          if [ -f "uv.lock" ]; then
-            echo "uv.lock encontrado! Sincronizando o formato para a versão atual do uv..."
-            # O 'uv lock' atualiza o arquivo pro formato novo, resolvendo o erro do 'source'
-            uv lock || true 
-            
-            echo "Exportando para requirements.txt..."
-            uv export --no-hashes > requirements.txt || true
-          fi
+          python3 -c '
+          import tomli
+          import os
+
+          if os.path.exists("uv.lock"):
+              try:
+                  with open("uv.lock", "rb") as f:
+                      lock_data = tomli.load(f)
+                  
+                  count = 0
+                  with open("requirements.txt", "w") as req:
+                      # O TOML do uv guarda os pacotes na chave [[package]]
+                      for pkg in lock_data.get("package", []):
+                          name = pkg.get("name")
+                          version = pkg.get("version")
+                          if name and version:
+                              req.write(f"{name}=={version}\n")
+                              count += 1
+                  print(f"✅ Sucesso: {count} dependências extraídas do uv.lock para o requirements.txt!")
+              except Exception as e:
+                  print(f"❌ Erro ao ler uv.lock com tomli: {e}")
+          else:
+              print("Arquivo uv.lock não encontrado.")
+          '
           
-          # Fallback de emergência: se o export falhou e o requirements.txt não foi criado
-          if [ ! -f "requirements.txt" ] && [ -f "pyproject.toml" ]; then
-            echo "Tentando compilar direto do pyproject.toml como plano B..."
-            uv pip compile pyproject.toml -o requirements.txt || true
-          fi
-          
-          # Se tudo deu certo, instala para o Dependency-Check poder analisar
           if [ -f "requirements.txt" ]; then 
-            pip install -r requirements.txt || true
+            echo "--- Resumo do requirements.txt gerado ---"
+            head -n 5 requirements.txt
           else
-            echo "::warning::Não foi possível gerar o requirements.txt. O scan de SCA pode ficar incompleto."
+            echo "::warning::requirements.txt não foi gerado. Dependency-Check ficará cego para Python."
           fi
           
       - name: Gerar SBOM com Syft
