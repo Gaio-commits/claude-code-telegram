@@ -12,11 +12,12 @@ on:
   # Roda automático toda vez que subir código
   push:
     branches:
-      - main 
+      - '**' #main
 
   pull_request:
     branches:
       - main
+      - fix/appsec-tools
 
   schedule:
     - cron: '0 0 * * 1' 
@@ -333,20 +334,26 @@ jobs:
       - name: Checkout do código
         uses: actions/checkout@v4
 
-      - name: Executar Trivy (Filesystem)
-        uses: aquasecurity/trivy-action@0.29.0
-        with:
-          scan-type: 'fs'
-          scan-ref: '.'
-          scanners: 'vuln,misconfig,license'
-          format: 'sarif'                
-          output: 'trivy-fs-results.sarif' 
-          severity: 'CRITICAL,HIGH'
-          skip-files: "**/*.pt,**/*.pth,**/*.h5,**/*.gguf,**/*.safetensors,**/*.pkl,**/*.bin,**/*.onnx"
-          ignore-unfixed: true
-          exit-code: '0'       
+      - name: Instalar Trivy Manualmente
+        run: |
+          sudo apt-get install wget apt-transport-https gnupg lsb-release -y
+          wget -qO - https://aquasecurity.github.io/trivy-repo/pubkey.gpg | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy -y
+
+      - name: Executar Trivy Scan
+        run: |
+          trivy fs . \
+            --format sarif \
+            --output trivy-fs-results.sarif \
+            --severity CRITICAL,HIGH \
+            --scanners vuln,misconfig,license \
+            --skip-files "**/*.pt,**/*.pth,**/*.h5,**/*.gguf,**/*.safetensors,**/*.pkl,**/*.bin,**/*.onnx" \
+            --ignore-unfixed
 
       - name: Upload Relatório Trivy (Artefato)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: Relatorio-Config-Trivy
