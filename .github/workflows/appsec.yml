@@ -334,23 +334,17 @@ jobs:
       - name: Checkout do código
         uses: actions/checkout@v4
 
-      - name: Instalar Trivy Manualmente
-        run: |
-          sudo apt-get install wget apt-transport-https gnupg lsb-release -y
-          wget -qO - https://aquasecurity.github.io/trivy-repo/pubkey.gpg | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
-          echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install trivy -y
-
-      - name: Executar Trivy Scan
-        run: |
-          trivy fs . \
-            --format sarif \
-            --output trivy-fs-results.sarif \
-            --severity CRITICAL,HIGH \
-            --scanners vuln,misconfig,license \
-            --skip-files "**/*.pt,**/*.pth,**/*.h5,**/*.gguf,**/*.safetensors,**/*.pkl,**/*.bin,**/*.onnx" \
-            --ignore-unfixed
+      - name: Executar Trivy Vulnerability Scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-fs-results.sarif'
+          severity: 'CRITICAL,HIGH'
+          scanners: 'vuln,misconfig,license'
+          skip-dirs: 'venv,.venv,build'
+          ignore-unfixed: true
 
       - name: Upload Relatório Trivy (Artefato)
         if: always()
@@ -361,7 +355,7 @@ jobs:
 
       - name: Enviar para GitHub Security
         if: always() && hashFiles('trivy-fs-results.sarif') != ''
-        uses: github/codeql-action/upload-sarif@v4 
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: 'trivy-fs-results.sarif'
           category: trivy-fs-ai-litigation
